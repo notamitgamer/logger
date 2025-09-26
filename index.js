@@ -1,4 +1,5 @@
-import makeWASocket, {
+import {
+    makeWASocket,
     makeCacheableSignalKeyStore,
     useMultiFileAuthState,
     DisconnectReason,

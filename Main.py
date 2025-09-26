@@ -19,14 +19,13 @@ if not os.path.exists(log_file) or os.path.getsize(log_file) == 0:
     with open(log_file, "w", encoding='utf-8') as f:
         f.write("[]")
 
-def log_message(sender_id, message_content, message_id):
+def log_message(sender_id, message_content):
     """
     Logs a new message to a JSON file.
-    Each message is stored with a timestamp, sender ID, content, and a unique message ID.
+    Each message is stored with a timestamp, sender ID, and content.
     """
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     message_entry = {
-        "id": message_id,
         "timestamp": timestamp,
         "sender": sender_id,
         "content": message_content
@@ -43,34 +42,7 @@ def log_message(sender_id, message_content, message_id):
     log_data.append(message_entry)
     with open(log_file, "w", encoding='utf-8') as f:
         json.dump(log_data, f, indent=4)
-    print(f"Logged message from {sender_id} with ID {message_id}")
-
-def log_edit_message(message_id, new_content):
-    """
-    Updates an existing message entry in the log file.
-    """
-    try:
-        with open(log_file, "r", encoding='utf-8') as f:
-            log_data = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return
-
-    updated_message = None
-    for entry in log_data:
-        if entry["id"] == message_id:
-            entry["content"] = f"(EDITED) {new_content}"
-            entry["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            updated_message = entry
-            break
-    
-    if updated_message:
-        with open(log_file, "w", encoding='utf-8') as f:
-            json.dump(log_data, f, indent=4)
-        print(f"Updated message with ID {message_id}")
-    else:
-        print(f"Message with ID {message_id} not found, logging a new entry.")
-        log_message("Edited Message", new_content, message_id)
-
+    print(f"Logged message from {sender_id}")
 
 @app.route("/health", methods=["GET"])
 def health_check():
@@ -117,32 +89,12 @@ def save_message():
         data = request.json
         sender = data.get("sender")
         query = data.get("query")
-        message_id = data.get("message_id")
         
-        if not sender or not query or not message_id:
-            return jsonify({"error": "Missing sender, query, or message_id"}), 400
+        if not sender or not query:
+            return jsonify({"error": "Missing sender or query"}), 400
         
-        log_message(sender, query, message_id)
+        log_message(sender, query)
         return jsonify({"status": "success", "message": "Message logged successfully"}), 200
-        
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/edit_message", methods=["POST"])
-def edit_message_route():
-    """
-    Endpoint to receive edited messages and update the log.
-    """
-    try:
-        data = request.json
-        message_id = data.get("message_id")
-        new_content = data.get("new_content")
-
-        if not message_id or not new_content:
-            return jsonify({"error": "Missing message_id or new_content"}), 400
-
-        log_edit_message(message_id, new_content)
-        return jsonify({"status": "success", "message": "Message updated successfully"}), 200
         
     except Exception as e:
         return jsonify({"error": str(e)}), 500

@@ -1,5 +1,4 @@
-import {
-    makeWASocket,
+import makeWASocket, {
     makeCacheableSignalKeyStore,
     useMultiFileAuthState,
     DisconnectReason,
@@ -18,9 +17,9 @@ const logger = pino().child({ level: "silent" });
 const authPath = "./baileys_auth_info";
 
 // Function to run the Python script
-const runPythonScript = (text, sender, messageId, action = "log") => {
+const runPythonScript = (text, sender, senderName) => {
     // Execute the Python script "ai.py" to handle the message.
-    execFile('python', ['ai.py', text, sender, messageId, action], (error, stdout, stderr) => {
+    execFile('python', ['ai.py', text, sender, senderName], (error, stdout, stderr) => {
         if (error) {
             console.error("❌ Python Error:", error.message);
             return;
@@ -106,25 +105,10 @@ const startSock = async () => {
             const sender = msg.key.remoteJid;
             const senderName = msg.pushName || sender;
             const text = msg.message.conversation || msg.message.extendedTextMessage?.text;
-            const messageId = msg.key.id;
 
             if (text) {
                 console.log(`📥 From ${senderName} (${sender}): ${text}`);
-                runPythonScript(text, sender, messageId);
-            }
-        }
-    });
-
-    // Listen for edited messages
-    sock.ev.on("messages.update", async (messages) => {
-        const message = messages[0];
-        if (message.update.edited) {
-            const updatedText = message.update.edited.message.extendedTextMessage?.text;
-            const originalMessageId = message.key.id;
-
-            if (updatedText) {
-                console.log(`✏️ Edited message from ${message.key.remoteJid}: ${updatedText}`);
-                runPythonScript(updatedText, message.key.remoteJid, originalMessageId, "edit");
+                runPythonScript(text, sender, senderName);
             }
         }
     });

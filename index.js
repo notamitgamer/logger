@@ -59,7 +59,7 @@ async function startWhatsApp() {
         printQRInTerminal: false,
         auth: state,
         browser: ["WhatsApp Logger by notamitgamer", "Chrome", "1.0.0"],
-        syncFullHistory: false 
+        syncFullHistory: true // CRITICAL: Must be true to get Contact Sync (Real Numbers)
     });
 
     sock.ev.on('connection.update', (update) => {
@@ -84,6 +84,33 @@ async function startWhatsApp() {
     });
 
     sock.ev.on('creds.update', saveCreds);
+
+    // --- FEATURE: REAL NUMBER SYNC ---
+    // This listener translates LIDs (1155...) into Real Phone Numbers (91...)
+    // and updates the Firestore Chat document automatically.
+    sock.ev.on('contacts.upsert', async (contacts) => {
+        for (const contact of contacts) {
+            // We look for contacts that have both a Phone ID and a LID
+            if (contact.id && contact.lid) {
+                const realNumber = contact.id.split('@')[0];
+                const displayName = contact.name || contact.notify || undefined;
+
+                try {
+                    const updateData = { phoneNumber: realNumber };
+                    if (displayName) updateData.displayName = displayName;
+
+                    // 1. Update the LID Chat (The one you see in the viewer)
+                    await db.collection('Chats').doc(contact.lid).set(updateData, { merge: true });
+                    
+                    // 2. Update the Phone Chat (The "Ghost" chat, just in case)
+                    await db.collection('Chats').doc(contact.id).set(updateData, { merge: true });
+                    
+                } catch (err) {
+                    // Silent fail to keep logs clean
+                }
+            }
+        }
+    });
 
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
         if (type !== 'notify' && type !== 'append') return;
@@ -110,18 +137,19 @@ async function startWhatsApp() {
 
                 const isFromMe = msg.key.fromMe || false;
                 const senderName = isFromMe ? "Me" : (msg.pushName || "Unknown");
-                const phoneNumber = remoteJid.split('@')[0]; // Extract number from JID
+                
+                // Fallback number (will be overwritten by contacts.upsert later)
+                const phoneNumber = remoteJid.split('@')[0]; 
 
-                // --- FIX: Create/Update Parent Chat Document ---
-                // This makes the chat visible in the list automatically
+                // 1. Ensure Chat Document Exists (Fixes "No Chats" issue)
                 await db.collection('Chats').doc(remoteJid).set({
                     lastActive: timestamp,
-                    displayName: senderName,
-                    phoneNumber: phoneNumber, // Added: Save phone number/ID to Chat
-                    id: remoteJid
+                    id: remoteJid,
+                    // We don't overwrite phoneNumber here blindly, relying on the Sync listener
+                    // to provide the accurate "91..." number.
                 }, { merge: true });
 
-                // --- Save Message ---
+                // 2. Save Message
                 await db.collection('Chats')
                     .doc(remoteJid)
                     .collection('Messages')
@@ -130,7 +158,6 @@ async function startWhatsApp() {
                         text: textContent,
                         senderId: remoteJid,
                         senderName: senderName,
-                        senderPhoneNumber: phoneNumber, // Added: Save phone number/ID to Message
                         timestamp: timestamp,
                         fromMe: isFromMe,
                         id: msg.key.id
@@ -160,14 +187,13 @@ function parseCookies(request) {
 
 // --- EXPRESS ROUTES ---
 
-// 1. PUBLIC ROUTE: Ping
+// 1. Ping (UptimeRobot)
 app.get('/ping', (req, res) => {
     res.status(200).send('Pong');
 });
 
-// 2. PUBLIC ROUTE: Verify Credentials API
+// 2. API: Verify Credentials (For External Frontend)
 app.post('/api/verify', (req, res) => {
-    // CORS Headers
     res.header("Access-Control-Allow-Origin", "*");
     res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept");
 
@@ -180,13 +206,14 @@ app.post('/api/verify', (req, res) => {
     }
 });
 
+// CORS Pre-flight
 app.options('/api/verify', (req, res) => {
     res.header("Access-Control-Allow-Origin", "*");
     res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept");
     res.sendStatus(200);
 });
 
-// 3. LOGIN PAGE (GET)
+// 3. Login Page
 app.get('/login', (req, res) => {
     res.send(`
         <html>
@@ -214,49 +241,39 @@ app.get('/login', (req, res) => {
     `);
 });
 
-// 4. LOGIN ACTION (POST)
+// 4. Login Action
 app.post('/login', (req, res) => {
     const { username, password, remember } = req.body;
 
     if (username === AUTH_USER && password === AUTH_PASS) {
         let cookieSettings = 'HttpOnly; Path=/;'; 
+        if (remember === 'yes') cookieSettings += ' Max-Age=300;';
         
-        if (remember === 'yes') {
-            cookieSettings += ' Max-Age=300;';
-        }
-
         res.setHeader('Set-Cookie', `auth_session=${SESSION_SECRET}; ${cookieSettings}`);
         return res.redirect('/');
     }
-    
     res.status(401).send('Invalid credentials. <a href="/login">Try again</a>');
 });
 
-// 5. LOGOUT ACTION
+// 5. Logout
 app.get('/logout', (req, res) => {
     res.setHeader('Set-Cookie', 'auth_session=; Max-Age=0; Path=/;');
     res.redirect('/login');
 });
 
-// --- MIDDLEWARE: FORM AUTH ---
+// --- MIDDLEWARE ---
 const checkAuth = (req, res, next) => {
     if (!AUTH_USER || !AUTH_PASS) return next();
-
     const cookies = parseCookies(req);
-    if (cookies.auth_session === SESSION_SECRET) {
-        return next();
-    }
-
-    if (req.path.startsWith('/api')) {
-        res.status(401).send('Unauthorized');
-    } else {
-        res.redirect('/login');
-    }
+    if (cookies.auth_session === SESSION_SECRET) return next();
+    
+    if (req.path.startsWith('/api')) res.status(401).send('Unauthorized');
+    else res.redirect('/login');
 };
 
 app.use(checkAuth);
 
-// 6. PROTECTED ROUTE: Main Page (QR Code)
+// 6. Main Route
 app.get('/', async (req, res) => {
     const logoutBtn = `<a href="/logout" style="position: absolute; top: 10px; right: 10px; padding: 8px 16px; background: #ff4444; color: white; text-decoration: none; border-radius: 4px; font-size: 14px;">Logout</a>`;
 
@@ -311,10 +328,4 @@ app.get('/', async (req, res) => {
 app.listen(PORT, () => {
     startWhatsApp();
     console.log(`Server running on port ${PORT}`);
-    
-    if (AUTH_USER && AUTH_PASS) {
-        console.log("Security: Form Authentication is ENABLED.");
-    } else {
-        console.log("Security: Form Authentication is DISABLED (Env vars missing).");
-    }
 });

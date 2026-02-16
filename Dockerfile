@@ -1,5 +1,16 @@
 FROM node:18-slim
 
+# Install system dependencies
+# We add git because some npm packages require it to fetch dependencies.
+# We add python3, make, and g++ because some crypto libraries used by Baileys 
+# might need to compile native code.
+RUN apt-get update && apt-get install -y \
+    git \
+    python3 \
+    make \
+    g++ \
+    && rm -rf /var/lib/apt/lists/*
+
 # Create app directory
 WORKDIR /usr/src/app
 

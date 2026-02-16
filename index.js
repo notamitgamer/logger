@@ -110,12 +110,14 @@ async function startWhatsApp() {
 
                 const isFromMe = msg.key.fromMe || false;
                 const senderName = isFromMe ? "Me" : (msg.pushName || "Unknown");
+                const phoneNumber = remoteJid.split('@')[0]; // Extract number from JID
 
                 // --- FIX: Create/Update Parent Chat Document ---
                 // This makes the chat visible in the list automatically
                 await db.collection('Chats').doc(remoteJid).set({
                     lastActive: timestamp,
                     displayName: senderName,
+                    phoneNumber: phoneNumber, // Added: Save phone number/ID to Chat
                     id: remoteJid
                 }, { merge: true });
 
@@ -128,6 +130,7 @@ async function startWhatsApp() {
                         text: textContent,
                         senderId: remoteJid,
                         senderName: senderName,
+                        senderPhoneNumber: phoneNumber, // Added: Save phone number/ID to Message
                         timestamp: timestamp,
                         fromMe: isFromMe,
                         id: msg.key.id

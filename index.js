@@ -20,6 +20,7 @@ const AUTH_PASS = process.env.AUTH_PASS;
 // Initialize Express
 const app = express();
 app.use(express.urlencoded({ extended: true })); // Parse form data
+app.use(express.json()); // Parse JSON bodies (for API requests)
 
 // --- FIREBASE SETUP ---
 let serviceAccount;
@@ -42,9 +43,9 @@ try {
 const db = admin.firestore();
 
 // --- BAILEYS SETUP ---
-let qrCodeData = null; // Store current QR code
+let qrCodeData = null; 
 let sock = null;
-let isConnected = false; // Track actual auth state
+let isConnected = false; 
 
 async function startWhatsApp() {
     const logger = pino({ level: 'silent' });
@@ -131,7 +132,6 @@ async function startWhatsApp() {
 }
 
 // --- AUTH UTILS ---
-// Generate a simple session token (in production use a real secret)
 const SESSION_SECRET = crypto.createHash('sha256').update(AUTH_PASS || 'default').digest('hex');
 
 function parseCookies(request) {
@@ -148,12 +148,36 @@ function parseCookies(request) {
 
 // --- EXPRESS ROUTES ---
 
-// 1. PUBLIC ROUTE: Ping (UptimeRobot)
+// 1. PUBLIC ROUTE: Ping
 app.get('/ping', (req, res) => {
     res.status(200).send('Pong');
 });
 
-// 2. LOGIN PAGE (GET)
+// 2. PUBLIC ROUTE (NEW): Verify Credentials API
+// We add CORS headers specifically for this response so your frontend can read it
+app.post('/api/verify', (req, res) => {
+    // CORS Headers
+    res.header("Access-Control-Allow-Origin", "*"); // Allow any domain (or set to your specific domain)
+    res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept");
+
+    const { username, password } = req.body;
+
+    if (username === AUTH_USER && password === AUTH_PASS) {
+        return res.json({ success: true });
+    } else {
+        return res.status(401).json({ success: false });
+    }
+});
+
+// Handle OPTIONS requests for CORS pre-flight checks
+app.options('/api/verify', (req, res) => {
+    res.header("Access-Control-Allow-Origin", "*");
+    res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept");
+    res.sendStatus(200);
+});
+
+
+// 3. LOGIN PAGE (GET)
 app.get('/login', (req, res) => {
     res.send(`
         <html>
@@ -181,18 +205,16 @@ app.get('/login', (req, res) => {
     `);
 });
 
-// 3. LOGIN ACTION (POST)
+// 4. LOGIN ACTION (POST)
 app.post('/login', (req, res) => {
     const { username, password, remember } = req.body;
 
     if (username === AUTH_USER && password === AUTH_PASS) {
-        let cookieSettings = 'HttpOnly; Path=/;'; // HttpOnly prevents JS access (Security)
+        let cookieSettings = 'HttpOnly; Path=/;'; 
         
         if (remember === 'yes') {
-            // Add Max-Age = 300 seconds (5 minutes)
             cookieSettings += ' Max-Age=300;';
         }
-        // If not remembered, no Max-Age = Session Cookie (Expires when browser closes)
 
         res.setHeader('Set-Cookie', `auth_session=${SESSION_SECRET}; ${cookieSettings}`);
         return res.redirect('/');
@@ -201,23 +223,22 @@ app.post('/login', (req, res) => {
     res.status(401).send('Invalid credentials. <a href="/login">Try again</a>');
 });
 
-// 4. LOGOUT ACTION
+// 5. LOGOUT ACTION
 app.get('/logout', (req, res) => {
     res.setHeader('Set-Cookie', 'auth_session=; Max-Age=0; Path=/;');
     res.redirect('/login');
 });
 
 // --- MIDDLEWARE: FORM AUTH ---
+// ALL ROUTES BELOW THIS REQUIRE LOGIN
 const checkAuth = (req, res, next) => {
     if (!AUTH_USER || !AUTH_PASS) return next();
 
     const cookies = parseCookies(req);
-    // Check if the cookie exists and matches our secret
     if (cookies.auth_session === SESSION_SECRET) {
         return next();
     }
 
-    // If API/Asset request, send 401, else redirect to login
     if (req.path.startsWith('/api')) {
         res.status(401).send('Unauthorized');
     } else {
@@ -227,20 +248,20 @@ const checkAuth = (req, res, next) => {
 
 app.use(checkAuth);
 
-// 5. PROTECTED ROUTE: Serve Static Frontend
-app.use(express.static(path.join(__dirname, 'public')));
-
-// 6. PROTECTED ROUTE: Main Page (QR Code or Status)
+// 6. PROTECTED ROUTE: Main Page (QR Code)
 app.get('/', async (req, res) => {
-    const logoutBtn = `<a href="/logout" style="position: absolute; top: 10px; right: 10px; padding: 10px; background: #ff4444; color: white; text-decoration: none; border-radius: 4px; font-size: 14px;">Logout</a>`;
+    const logoutBtn = `<a href="/logout" style="position: absolute; top: 10px; right: 10px; padding: 8px 16px; background: #ff4444; color: white; text-decoration: none; border-radius: 4px; font-size: 14px;">Logout</a>`;
 
     if (isConnected) {
         return res.send(`
             <html>
-                <body style="font-family: sans-serif; text-align: center; padding-top: 50px;">
+                <body style="font-family: sans-serif; text-align: center; padding-top: 50px; background-color: #f0f2f5;">
                     ${logoutBtn}
-                    <h2 style="color: green;">System Operational</h2>
-                    <p>Connected to WhatsApp.</p>
+                    <div style="background: white; padding: 40px; border-radius: 10px; display: inline-block; box-shadow: 0 4px 12px rgba(0,0,0,0.1);">
+                        <h2 style="color: green;">System Operational</h2>
+                        <p style="color: #555;">Connected to WhatsApp.</p>
+                        <p style="color: #999; font-size: 12px;">Back-end Service</p>
+                    </div>
                 </body>
             </html>
         `);
@@ -252,11 +273,13 @@ app.get('/', async (req, res) => {
             return res.send(`
                 <html>
                     <head><meta http-equiv="refresh" content="5"></head>
-                    <body style="font-family: sans-serif; text-align: center; padding-top: 50px;">
+                    <body style="font-family: sans-serif; text-align: center; padding-top: 50px; background-color: #f0f2f5;">
                         ${logoutBtn}
-                        <h2>Scan to Link</h2>
-                        <img src="${qrImage}" alt="QR Code" />
-                        <p>Refreshes every 5 seconds...</p>
+                        <div style="background: white; padding: 40px; border-radius: 10px; display: inline-block; box-shadow: 0 4px 12px rgba(0,0,0,0.1);">
+                            <h2>Scan to Link</h2>
+                            <img src="${qrImage}" alt="QR Code" />
+                            <p style="color: #666;">Refreshes every 5 seconds...</p>
+                        </div>
                     </body>
                 </html>
             `);
@@ -268,7 +291,10 @@ app.get('/', async (req, res) => {
     return res.send(`
         <html>
             <head><meta http-equiv="refresh" content="2"></head>
-            <body>Initializing... please refresh.</body>
+            <body style="font-family: sans-serif; text-align: center; padding-top: 50px;">
+                <p>Initializing... please refresh.</p>
+                ${logoutBtn}
+            </body>
         </html>
     `);
 });

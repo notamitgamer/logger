@@ -58,7 +58,7 @@ async function startWhatsApp() {
         logger,
         printQRInTerminal: false,
         auth: state,
-        browser: ["WhatsApp Logger", "Chrome", "1.0.0"],
+        browser: ["WhatsApp Logger by notamitgamer", "Chrome", "1.0.0"],
         syncFullHistory: false 
     });
 

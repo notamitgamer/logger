@@ -115,14 +115,21 @@ async function startWhatsApp() {
                 // Determine name: Use "Me" for outgoing, otherwise pushName or Unknown
                 const senderName = isFromMe ? "Me" : (msg.pushName || "Unknown");
 
-                await db.collection('Chats').doc(remoteJid).collection('Messages').add({
-                    text: textContent,
-                    senderId: remoteJid,
-                    senderName: senderName,
-                    timestamp: timestamp,
-                    fromMe: isFromMe,
-                    id: msg.key.id
-                });
+                // --- SAVE TO FIRESTORE ---
+                // UPDATE: Using .doc(msg.key.id).set(...) instead of .add(...)
+                // This ensures IDEMPOTENCY. If the same message arrives twice, it won't duplicate.
+                await db.collection('Chats')
+                    .doc(remoteJid)
+                    .collection('Messages')
+                    .doc(msg.key.id) // <--- CRITICAL CHANGE: Use WhatsApp ID as Doc ID
+                    .set({
+                        text: textContent,
+                        senderId: remoteJid,
+                        senderName: senderName,
+                        timestamp: timestamp,
+                        fromMe: isFromMe,
+                        id: msg.key.id
+                    }, { merge: true }); // Merge ensures we don't accidentally wipe fields if we add more later
 
             } catch (err) {
                 // Silent error handling
@@ -134,15 +141,12 @@ async function startWhatsApp() {
 // --- EXPRESS ROUTES ---
 
 // 1. PUBLIC ROUTE: Ping (Must be before Auth middleware)
-// This allows UptimeRobot to keep the server alive without needing a password.
 app.get('/ping', (req, res) => {
     res.status(200).send('Pong');
 });
 
 // --- MIDDLEWARE: BASIC AUTH ---
-// All routes defined BELOW this point will require a password.
 const checkAuth = (req, res, next) => {
-    // If vars aren't set in Render, allow access (fallback)
     if (!AUTH_USER || !AUTH_PASS) return next();
 
     const b64auth = (req.headers.authorization || '').split(' ')[1] || '';
@@ -159,12 +163,10 @@ const checkAuth = (req, res, next) => {
 app.use(checkAuth);
 
 // 2. PROTECTED ROUTE: Serve Static Frontend
-// If you put index.html in a 'public' folder, it will be served here.
 app.use(express.static(path.join(__dirname, 'public')));
 
 // 3. PROTECTED ROUTE: Main Page (QR Code or Status)
 app.get('/', async (req, res) => {
-    // Check isConnected variable
     if (isConnected) {
         return res.send(`
             <html>

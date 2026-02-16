@@ -19,22 +19,6 @@ const AUTH_PASS = process.env.AUTH_PASS;
 // Initialize Express
 const app = express();
 
-// --- MIDDLEWARE: BASIC AUTH ---
-// Protects the frontend and QR code page
-const checkAuth = (req, res, next) => {
-    if (!AUTH_USER || !AUTH_PASS) return next(); // Skip if vars not set
-
-    const b64auth = (req.headers.authorization || '').split(' ')[1] || '';
-    const [login, password] = Buffer.from(b64auth, 'base64').toString().split(':');
-
-    if (login && password && login === AUTH_USER && password === AUTH_PASS) {
-        return next();
-    }
-
-    res.set('WWW-Authenticate', 'Basic realm="401"');
-    res.status(401).send('Authentication required to access WhatsApp Logger.');
-};
-
 // --- FIREBASE SETUP ---
 let serviceAccount;
 try {
@@ -109,7 +93,6 @@ async function startWhatsApp() {
 
                 // For sent messages, remoteJid is the Recipient. 
                 // For received messages, remoteJid is the Sender.
-                // This keeps both sides of the conversation in the same "Chat" bucket.
                 const remoteJid = msg.key.remoteJid;
                 
                 if (remoteJid === 'status@broadcast') continue;
@@ -150,13 +133,36 @@ async function startWhatsApp() {
 
 // --- EXPRESS ROUTES ---
 
-// 1. Apply Auth to ALL routes (including static files if you add them later)
+// 1. PUBLIC ROUTE: Ping (Must be before Auth middleware)
+// This allows UptimeRobot to keep the server alive without needing a password.
+app.get('/ping', (req, res) => {
+    res.status(200).send('Pong');
+});
+
+// --- MIDDLEWARE: BASIC AUTH ---
+// All routes defined BELOW this point will require a password.
+const checkAuth = (req, res, next) => {
+    // If vars aren't set in Render, allow access (fallback)
+    if (!AUTH_USER || !AUTH_PASS) return next();
+
+    const b64auth = (req.headers.authorization || '').split(' ')[1] || '';
+    const [login, password] = Buffer.from(b64auth, 'base64').toString().split(':');
+
+    if (login && password && login === AUTH_USER && password === AUTH_PASS) {
+        return next();
+    }
+
+    res.set('WWW-Authenticate', 'Basic realm="401"');
+    res.status(401).send('Authentication required to access WhatsApp Logger.');
+};
+
 app.use(checkAuth);
 
-// 2. Serve Static Frontend (Optional: If you place index.html in a 'public' folder)
+// 2. PROTECTED ROUTE: Serve Static Frontend
+// If you put index.html in a 'public' folder, it will be served here.
 app.use(express.static(path.join(__dirname, 'public')));
 
-// 3. Root Endpoint: Show QR Code or Status
+// 3. PROTECTED ROUTE: Main Page (QR Code or Status)
 app.get('/', async (req, res) => {
     // Check isConnected variable
     if (isConnected) {
@@ -196,12 +202,8 @@ app.get('/', async (req, res) => {
     `);
 });
 
-// Ping endpoint (Bypass Auth for UptimeRobot)
-// We put this BEFORE the auth check middleware? No, we used app.use(checkAuth) globally.
-// To fix UptimeRobot failure, we must exclude /ping from auth.
-// Let's redefine routes to ensure /ping is open.
-
-// ... resetting routes structure for correctness ...
-
-// Clear previous app.use to handle ordering correctly
-app._router.stack.pop(); // (Conceptual remove, we will just restructure below)
+// --- START SERVER ---
+app.listen(PORT, () => {
+    startWhatsApp();
+    console.log(`Server running on port ${PORT}`);
+});

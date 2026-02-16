@@ -111,6 +111,15 @@ async function startWhatsApp() {
                 const isFromMe = msg.key.fromMe || false;
                 const senderName = isFromMe ? "Me" : (msg.pushName || "Unknown");
 
+                // --- FIX: Create/Update Parent Chat Document ---
+                // This makes the chat visible in the list automatically
+                await db.collection('Chats').doc(remoteJid).set({
+                    lastActive: timestamp,
+                    displayName: senderName,
+                    id: remoteJid
+                }, { merge: true });
+
+                // --- Save Message ---
                 await db.collection('Chats')
                     .doc(remoteJid)
                     .collection('Messages')
@@ -153,11 +162,10 @@ app.get('/ping', (req, res) => {
     res.status(200).send('Pong');
 });
 
-// 2. PUBLIC ROUTE (NEW): Verify Credentials API
-// We add CORS headers specifically for this response so your frontend can read it
+// 2. PUBLIC ROUTE: Verify Credentials API
 app.post('/api/verify', (req, res) => {
     // CORS Headers
-    res.header("Access-Control-Allow-Origin", "*"); // Allow any domain (or set to your specific domain)
+    res.header("Access-Control-Allow-Origin", "*");
     res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept");
 
     const { username, password } = req.body;
@@ -169,13 +177,11 @@ app.post('/api/verify', (req, res) => {
     }
 });
 
-// Handle OPTIONS requests for CORS pre-flight checks
 app.options('/api/verify', (req, res) => {
     res.header("Access-Control-Allow-Origin", "*");
     res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept");
     res.sendStatus(200);
 });
-
 
 // 3. LOGIN PAGE (GET)
 app.get('/login', (req, res) => {
@@ -230,7 +236,6 @@ app.get('/logout', (req, res) => {
 });
 
 // --- MIDDLEWARE: FORM AUTH ---
-// ALL ROUTES BELOW THIS REQUIRE LOGIN
 const checkAuth = (req, res, next) => {
     if (!AUTH_USER || !AUTH_PASS) return next();
 

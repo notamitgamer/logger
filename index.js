@@ -17,14 +17,11 @@ const PORT = process.env.PORT || 3000;
 const app = express();
 
 // --- FIREBASE SETUP ---
-// We check for the environment variable 'FIREBASE_SERVICE_ACCOUNT'
-// This should contain the JSON string of your service account key.
 let serviceAccount;
 try {
     if (process.env.FIREBASE_SERVICE_ACCOUNT) {
         serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
     } else {
-        // Fallback for local testing if file exists
         serviceAccount = require('./serviceAccountKey.json');
     }
 
@@ -42,9 +39,9 @@ const db = admin.firestore();
 // --- BAILEYS SETUP ---
 let qrCodeData = null; // Store current QR code
 let sock = null;
+let isConnected = false; // <--- FIX: Track actual auth state
 
 async function startWhatsApp() {
-    // Silent logger to prevent leaking data to logs
     const logger = pino({ level: 'silent' });
     
     const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
@@ -53,7 +50,7 @@ async function startWhatsApp() {
     sock = makeWASocket({
         version,
         logger,
-        printQRInTerminal: false, // We serve it via HTTP
+        printQRInTerminal: false,
         auth: state,
         browser: ["WhatsApp Logger", "Chrome", "1.0.0"],
         syncFullHistory: false 
@@ -63,17 +60,20 @@ async function startWhatsApp() {
         const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
-            qrCodeData = qr; // Update the QR to be served
+            qrCodeData = qr;
+            isConnected = false; // Ensure we know we aren't logged in yet
         }
 
         if (connection === 'close') {
+            isConnected = false; // Reset on disconnect
             const shouldReconnect = (lastDisconnect.error)?.output?.statusCode !== DisconnectReason.loggedOut;
-            // Only log system status, never data
             if (shouldReconnect) {
                 startWhatsApp();
             }
         } else if (connection === 'open') {
-            qrCodeData = null; // Clear QR code on success
+            console.log("System: Connection Open and Authenticated");
+            qrCodeData = null;
+            isConnected = true; // <--- FIX: Only true when fully open
         }
     });
 
@@ -87,14 +87,9 @@ async function startWhatsApp() {
             try {
                 if (!msg.message) continue;
 
-                // Extract Sender ID (phone number)
                 const remoteJid = msg.key.remoteJid;
-                
-                // Skip status updates (broadcasts)
                 if (remoteJid === 'status@broadcast') continue;
 
-                // Extract Content
-                // We check multiple fields to support text, replies, and captions
                 const textContent = 
                     msg.message.conversation || 
                     msg.message.extendedTextMessage?.text || 
@@ -102,14 +97,12 @@ async function startWhatsApp() {
                     msg.message.videoMessage?.caption || 
                     "";
 
-                if (!textContent) continue; // Skip if no text found
+                if (!textContent) continue;
 
                 const timestamp = msg.messageTimestamp 
                     ? (typeof msg.messageTimestamp === 'number' ? msg.messageTimestamp : msg.messageTimestamp.low) 
                     : Math.floor(Date.now() / 1000);
 
-                // --- SAVE TO FIRESTORE ---
-                // Structure: Chats -> [PhoneNumber] -> Messages -> [AutoID]
                 await db.collection('Chats').doc(remoteJid).collection('Messages').add({
                     text: textContent,
                     senderId: remoteJid,
@@ -120,7 +113,7 @@ async function startWhatsApp() {
                 });
 
             } catch (err) {
-                // Silently handle errors to keep logs clean
+                // Silent error handling
             }
         }
     });
@@ -130,7 +123,8 @@ async function startWhatsApp() {
 
 // Root: Show QR Code or Status
 app.get('/', async (req, res) => {
-    if (sock?.ws?.isOpen) {
+    // FIX: Check isConnected variable, NOT sock.ws.isOpen
+    if (isConnected) {
         return res.send(`
             <html>
                 <body style="font-family: sans-serif; text-align: center; padding-top: 50px;">
@@ -146,7 +140,7 @@ app.get('/', async (req, res) => {
             const qrImage = await QRCode.toDataURL(qrCodeData);
             return res.send(`
                 <html>
-                    <meta http-equiv="refresh" content="5">
+                    <head><meta http-equiv="refresh" content="5"></head>
                     <body style="font-family: sans-serif; text-align: center; padding-top: 50px;">
                         <h2>Scan to Link</h2>
                         <img src="${qrImage}" alt="QR Code" />
@@ -159,15 +153,18 @@ app.get('/', async (req, res) => {
         }
     }
 
-    return res.send("Initializing... please refresh.");
+    return res.send(`
+        <html>
+            <head><meta http-equiv="refresh" content="2"></head>
+            <body>Initializing... please refresh.</body>
+        </html>
+    `);
 });
 
-// Ping endpoint for UptimeRobot
 app.get('/ping', (req, res) => {
     res.send('Pong');
 });
 
-// Start the server
 app.listen(PORT, () => {
     startWhatsApp();
     console.log(`Server running on port ${PORT}`);

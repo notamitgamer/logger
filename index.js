@@ -74,6 +74,83 @@ try {
 
 const db = admin.firestore();
 
+// --- IN-MEMORY CACHE ---
+const EXCLUDED_JIDS = new Set(['917278779512@s.whatsapp.net', '201554426618024@lid']);
+
+let chatsCache = new Map();      // chatId -> chat data
+let messagesCache = new Map();   // chatId -> Map(msgId -> message data)
+let cacheReady = false;
+let consecutiveCacheFailures = 0;
+
+async function warmCache() {
+    try {
+        console.log("System: Warming cache from Firestore...");
+        
+        // 1. Fetch Chats
+        const chatsSnap = await db.collection('Chats').get();
+        chatsSnap.forEach(doc => {
+            if (!EXCLUDED_JIDS.has(doc.id)) {
+                chatsCache.set(doc.id, { id: doc.id, ...doc.data() });
+            }
+        });
+
+        // 2. Fetch all Messages via CollectionGroup
+        const msgsSnap = await db.collectionGroup('Messages').get();
+        msgsSnap.forEach(doc => {
+            const chatId = doc.ref.parent.parent.id;
+            if (!messagesCache.has(chatId)) messagesCache.set(chatId, new Map());
+            messagesCache.get(chatId).set(doc.id, doc.data());
+        });
+        
+        cacheReady = true;
+        consecutiveCacheFailures = 0;
+        console.log(`System: Cache warm. ${chatsCache.size} chats, ${msgsSnap.size} messages.`);
+
+        // 3. Start Permanent Listeners
+        startPermanentListeners();
+
+    } catch (err) {
+        consecutiveCacheFailures++;
+        const backoff = Math.min(5000 * Math.pow(2, consecutiveCacheFailures), 300000); // Max 5 min
+        console.error(`System: Cache warm failed (attempt ${consecutiveCacheFailures}). Retrying in ${backoff/1000}s.`, err.message);
+        setTimeout(warmCache, backoff);
+    }
+}
+
+function startPermanentListeners() {
+    // Shared Permanent Listener for Chats
+    db.collection('Chats').onSnapshot(snapshot => {
+        const changes = [];
+        snapshot.docChanges().forEach(change => {
+            if (EXCLUDED_JIDS.has(change.doc.id)) return;
+            const data = { id: change.doc.id, ...change.doc.data() };
+            chatsCache.set(change.doc.id, data);
+            changes.push({ type: change.type, doc: data });
+        });
+        if (changes.length > 0) {
+            const payload = `event: update\ndata: ${JSON.stringify(changes)}\n\n`;
+            clients.chats.forEach(res => { try { res.write(payload); } catch(e){} });
+        }
+    });
+
+    // Shared Permanent Listener for Messages
+    db.collectionGroup('Messages').onSnapshot(snapshot => {
+        snapshot.docChanges().forEach(change => {
+            const chatId = change.doc.ref.parent.parent.id;
+            if (!messagesCache.has(chatId)) messagesCache.set(chatId, new Map());
+            
+            const data = change.doc.data();
+            messagesCache.get(chatId).set(change.doc.id, data);
+
+            const chatClients = clients.messages.get(chatId);
+            if (chatClients) {
+                const payload = `event: update\ndata: ${JSON.stringify([{ type: change.type, doc: data }])}\n\n`;
+                chatClients.forEach(res => { try { res.write(payload); } catch(e){} });
+            }
+        });
+    });
+}
+
 // --- FIRESTORE AUTH ADAPTER FOR BAILEYS ---
 async function useFirestoreAuthState(db, collectionName = 'whatsapp_auth') {
     const collection = db.collection(collectionName);
@@ -87,7 +164,7 @@ async function useFirestoreAuthState(db, collectionName = 'whatsapp_auth') {
         }
     };
 
-    const readData = async (id) => {
+    const readData = async (id, throwOnError = false) => {
         try {
             const doc = await collection.doc(id).get();
             if (doc.exists) {
@@ -95,6 +172,7 @@ async function useFirestoreAuthState(db, collectionName = 'whatsapp_auth') {
             }
         } catch (err) {
             console.error("System: Error reading auth state:", err.message);
+            if (throwOnError) throw err;
         }
         return null;
     };
@@ -107,7 +185,13 @@ async function useFirestoreAuthState(db, collectionName = 'whatsapp_auth') {
         }
     };
 
-    const creds = (await readData('creds')) || initAuthCreds();
+    let creds;
+    try {
+        // Pass true to strictly enforce failure up to startWhatsApp for backoff
+        creds = (await readData('creds', true)) || initAuthCreds();
+    } catch (err) {
+        throw err;
+    }
 
     return {
         state: {
@@ -155,10 +239,25 @@ let qrCodeData = null;
 let sock = null;
 let isConnected = false; 
 
+let consecutiveAuthFailures = 0;
+let consecutiveConnectFailures = 0;
+
 async function startWhatsApp() {
     const logger = pino({ level: 'silent' });
     
-    const { state, saveCreds, clearState } = await useFirestoreAuthState(db, 'whatsapp_auth');
+    let authResult;
+    try {
+        authResult = await useFirestoreAuthState(db, 'whatsapp_auth');
+    } catch (err) {
+        consecutiveAuthFailures++;
+        const backoff = Math.min(5000 * Math.pow(2, consecutiveAuthFailures), 300000); // cap 5 min
+        console.error(`System: Auth state read failed (attempt ${consecutiveAuthFailures}). Retrying in ${backoff/1000}s.`);
+        setTimeout(startWhatsApp, backoff);
+        return;
+    }
+    consecutiveAuthFailures = 0; // Reset on success
+
+    const { state, saveCreds, clearState } = authResult;
     const { version } = await fetchLatestBaileysVersion();
 
     console.log("System: Connecting to WhatsApp servers...");
@@ -185,21 +284,23 @@ async function startWhatsApp() {
             const statusCode = lastDisconnect?.error?.output?.statusCode;
             const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
-            console.log(`System: Connection closed (Status: ${statusCode})`);
-
             if (shouldReconnect) {
-                console.log("System: Reconnecting in 5 seconds...");
-                setTimeout(startWhatsApp, 5000);
+                consecutiveConnectFailures++;
+                const backoff = Math.min(5000 * Math.pow(2, consecutiveConnectFailures), 300000); // cap 5 min
+                console.log(`System: Connection closed (Status: ${statusCode}). Reconnecting in ${backoff/1000}s...`);
+                setTimeout(startWhatsApp, backoff);
             } else {
                 console.log("System: Device Logged Out. Wiping session from Firestore.");
                 await clearState();
                 qrCodeData = null;
+                consecutiveConnectFailures = 0;
                 startWhatsApp(); 
             }
         } else if (connection === 'open') {
             console.log("System: Connection Open and Authenticated. Firebase Auth Sync Active.");
             qrCodeData = null;
             isConnected = true;
+            consecutiveConnectFailures = 0; // Reset on success
         }
     });
 
@@ -256,11 +357,11 @@ async function startWhatsApp() {
                 const isFromMe = msg.key.fromMe || false;
                 const senderName = isFromMe ? "Me" : (msg.pushName || "Unknown");
 
-                // 1. Ensure Chat Document Exists (Added preview for server-side grouping)
+                // 1. Ensure Chat Document Exists
                 await db.collection('Chats').doc(remoteJid).set({
                     lastActive: timestamp,
                     id: remoteJid,
-                    preview: textContent // Makes server-side SSE preview processing extremely lightweight
+                    preview: textContent 
                 }, { merge: true });
 
                 // 2. Save Message
@@ -312,17 +413,16 @@ const verifyLogsAccess = (req, res, next) => {
 
 // --- SSE CONNECTION MANAGER ---
 const MAX_CONNECTIONS_PER_TOKEN = 15;
-const activeConnections = []; // Tracks all SSE connections for limits/heartbeats
+const activeConnections = []; 
 const clients = {
     chats: new Set(),
-    messages: new Map() // chatId -> Set of response objects
+    messages: new Map() 
 };
 
 function enforceConnectionCeiling(req, res, cleanupFunction) {
     const token = req.query.token || req.headers.authorization?.split(' ')[1];
     activeConnections.push({ res, token, cleanup: cleanupFunction });
 
-    // Enforce cap per token to prevent free instance exhaustion
     const userConns = activeConnections.filter(c => c.token === token);
     if (userConns.length > MAX_CONNECTIONS_PER_TOKEN) {
         const oldestIdx = activeConnections.findIndex(c => c.token === token);
@@ -348,57 +448,6 @@ setInterval(() => {
     });
 }, 25000);
 
-// --- SHARED FIRESTORE LISTENERS ---
-const EXCLUDED_JIDS = new Set(['917278779512@s.whatsapp.net', '201554426618024@lid']);
-
-let chatsUnsubscribe = null;
-const messageListeners = new Map(); // chatId -> unsubscribe function
-
-function startChatsListener() {
-    if (chatsUnsubscribe) return;
-    let isFirstRun = true;
-    chatsUnsubscribe = db.collection('Chats').onSnapshot(snapshot => {
-        if (isFirstRun) {
-            isFirstRun = false; 
-            return; // Clients get initial state from .get(), only push deltas here
-        }
-        const changes = [];
-        snapshot.docChanges().forEach(change => {
-            if (!EXCLUDED_JIDS.has(change.doc.id)) {
-                changes.push({ type: change.type, doc: { id: change.doc.id, ...change.doc.data() } });
-            }
-        });
-        if (changes.length > 0) {
-            const payload = `event: update\ndata: ${JSON.stringify(changes)}\n\n`;
-            clients.chats.forEach(res => { try { res.write(payload); } catch(e){} });
-        }
-    });
-}
-
-function startMessagesListener(chatId) {
-    if (messageListeners.has(chatId)) return;
-    let isFirstRun = true;
-    const unsub = db.collection('Chats').doc(chatId).collection('Messages')
-        .orderBy('timestamp', 'asc')
-        .onSnapshot(snapshot => {
-            if (isFirstRun) {
-                isFirstRun = false;
-                return;
-            }
-            const changes = [];
-            snapshot.docChanges().forEach(change => {
-                changes.push({ type: change.type, doc: { id: change.doc.id, ...change.doc.data() } });
-            });
-            if (changes.length > 0) {
-                const payload = `event: update\ndata: ${JSON.stringify(changes)}\n\n`;
-                const chatClients = clients.messages.get(chatId);
-                if (chatClients) {
-                    chatClients.forEach(res => { try { res.write(payload); } catch(e){} });
-                }
-            }
-        });
-    messageListeners.set(chatId, unsub);
-}
 
 // --- EXPRESS ROUTES ---
 
@@ -423,7 +472,6 @@ app.post('/api/verify', (req, res) => {
     const { username, password } = req.body;
 
     if (username === AUTH_USER && password === AUTH_PASS) {
-        // Return token directly for the frontend to use in headers/EventSource
         return res.json({ success: true, token: SESSION_SECRET });
     } else {
         return res.status(401).json({ success: false });
@@ -432,6 +480,8 @@ app.post('/api/verify', (req, res) => {
 
 // --- API: Server Sent Events ---
 app.get('/api/chats/stream', verifyApiToken, async (req, res) => {
+    if (!cacheReady) return res.status(503).json({ error: 'Cache still warming, retry shortly' });
+
     res.writeHead(200, {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
@@ -440,35 +490,25 @@ app.get('/api/chats/stream', verifyApiToken, async (req, res) => {
     });
     if (res.flushHeaders) res.flushHeaders();
     if (res.socket) res.socket.setNoDelay(true);
-    res.write('\n'); // Flush headers
+    res.write('\n');
 
     const cleanup = () => {
         clients.chats.delete(res);
-        if (clients.chats.size === 0 && chatsUnsubscribe) {
-            chatsUnsubscribe();
-            chatsUnsubscribe = null;
-        }
     };
     
     enforceConnectionCeiling(req, res, cleanup);
     clients.chats.add(res);
 
-    // Initial load & Grouping server-side
     try {
-        const snapshot = await db.collection('Chats').get();
         const grouped = {};
         
-        snapshot.docs.forEach(doc => {
-            if (EXCLUDED_JIDS.has(doc.id)) return;
-            
-            const data = { id: doc.id, ...doc.data() };
+        chatsCache.forEach((data, docId) => {
             const phone = data.phoneNumber || data.id.split('@')[0];
             
             if (!grouped[phone]) {
                 grouped[phone] = { ...data, ids: [data.id] };
             } else {
                 grouped[phone].ids.push(data.id);
-                // Keep the most recent data
                 if ((data.lastActive || 0) > (grouped[phone].lastActive || 0)) {
                     grouped[phone].lastActive = data.lastActive;
                     grouped[phone].preview = data.preview || grouped[phone].preview;
@@ -481,11 +521,11 @@ app.get('/api/chats/stream', verifyApiToken, async (req, res) => {
     } catch (e) {
         console.error("Error sending initial chats:", e);
     }
-
-    startChatsListener();
 });
 
 app.get('/api/messages/stream', verifyApiToken, async (req, res) => {
+    if (!cacheReady) return res.status(503).json({ error: 'Cache still warming, retry shortly' });
+    
     const { chatId, since } = req.query;
     if (!chatId) return res.status(400).send('Missing chatId');
 
@@ -503,11 +543,7 @@ app.get('/api/messages/stream', verifyApiToken, async (req, res) => {
         const chatClients = clients.messages.get(chatId);
         if (chatClients) {
             chatClients.delete(res);
-            if (chatClients.size === 0 && messageListeners.has(chatId)) {
-                // Garbage collect listener if no one is watching this chat anymore
-                messageListeners.get(chatId)();
-                messageListeners.delete(chatId);
-            }
+            if (chatClients.size === 0) clients.messages.delete(chatId);
         }
     };
     
@@ -519,28 +555,41 @@ app.get('/api/messages/stream', verifyApiToken, async (req, res) => {
     clients.messages.get(chatId).add(res);
 
     try {
-        let query = db.collection('Chats').doc(chatId).collection('Messages').orderBy('timestamp', 'asc');
-        if (since) {
-            query = query.where('timestamp', '>', parseInt(since, 10));
+        let initialMessages = [];
+        const chatMsgs = messagesCache.get(chatId);
+        
+        if (chatMsgs) {
+            const sinceTs = since ? parseInt(since, 10) : 0;
+            for (const msg of chatMsgs.values()) {
+                if (msg.timestamp > sinceTs) {
+                    initialMessages.push(msg);
+                }
+            }
+            initialMessages.sort((a, b) => a.timestamp - b.timestamp);
         }
         
-        const snapshot = await query.get();
-        const initialMessages = snapshot.docs.map(doc => doc.data());
         res.write(`event: initial\ndata: ${JSON.stringify(initialMessages)}\n\n`);
     } catch (e) {
         console.error("Error sending initial messages:", e);
     }
-
-    startMessagesListener(chatId);
 });
 
 // --- API: Standard Actions ---
 app.post('/api/rename', verifyApiToken, async (req, res) => {
+    if (!cacheReady) return res.status(503).json({ error: 'Cache still warming, retry shortly' });
+
     const { id, customName } = req.body;
     if (!id || !customName) return res.status(400).json({ error: 'Missing parameters' });
     
     try {
+        // Fire & Forget to DB
         await db.collection('Chats').doc(id).set({ customName }, { merge: true });
+        
+        // Instant RAM update
+        if (chatsCache.has(id)) {
+            chatsCache.get(id).customName = customName;
+        }
+        
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -548,15 +597,15 @@ app.post('/api/rename', verifyApiToken, async (req, res) => {
 });
 
 app.get('/api/export', verifyApiToken, async (req, res) => {
+    if (!cacheReady) return res.status(503).json({ error: 'Cache still warming, retry shortly' });
+
     try {
         const exportData = { chats: {}, messages: {} };
-        const chatsSnap = await db.collection('Chats').get();
         
-        for (const doc of chatsSnap.docs) {
-            exportData.chats[doc.id] = doc.data();
-            const msgs = await db.collection('Chats').doc(doc.id).collection('Messages').get();
-            exportData.messages[doc.id] = msgs.docs.map(m => m.data());
-        }
+        chatsCache.forEach((data, id) => exportData.chats[id] = data);
+        messagesCache.forEach((msgMap, chatId) => {
+            exportData.messages[chatId] = Array.from(msgMap.values());
+        });
         
         res.json(exportData);
     } catch (err) {
@@ -707,6 +756,7 @@ app.get('/', async (req, res) => {
 
 // --- START SERVER ---
 app.listen(PORT, () => {
+    warmCache();
     startWhatsApp();
     console.log(`Server running on port ${PORT}`);
 });

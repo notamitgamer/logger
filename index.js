@@ -461,9 +461,9 @@ app.get('/api/chats/stream', verifyApiToken, async (req, res) => {
             const phone = data.phoneNumber || data.id.split('@')[0];
             
             if (!grouped[phone]) {
-                grouped[phone] = { ...data, subIds: [data.id] };
+                grouped[phone] = { ...data, ids: [data.id] };
             } else {
-                grouped[phone].subIds.push(data.id);
+                grouped[phone].ids.push(data.id);
                 // Keep the most recent data
                 if ((data.lastActive || 0) > (grouped[phone].lastActive || 0)) {
                     grouped[phone].lastActive = data.lastActive;

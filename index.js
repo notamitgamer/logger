@@ -28,6 +28,11 @@ app.use((req, res, next) => {
     next();
 });
 
+// Answer every OPTIONS preflight immediately — before ANY auth middleware sees it
+app.options('*', (req, res) => {
+    res.sendStatus(200);
+});
+
 // --- IN-MEMORY LOGGING BUFFER ---
 const MAX_LOGS = 500;
 const logBuffer = [];
@@ -425,17 +430,16 @@ app.post('/api/verify', (req, res) => {
     }
 });
 
-app.options('/api/verify', (req, res) => {
-    res.sendStatus(200);
-});
-
 // --- API: Server Sent Events ---
 app.get('/api/chats/stream', verifyApiToken, async (req, res) => {
     res.writeHead(200, {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive'
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no'
     });
+    if (res.flushHeaders) res.flushHeaders();
+    if (res.socket) res.socket.setNoDelay(true);
     res.write('\n'); // Flush headers
 
     const cleanup = () => {
@@ -488,8 +492,11 @@ app.get('/api/messages/stream', verifyApiToken, async (req, res) => {
     res.writeHead(200, {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive'
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no'
     });
+    if (res.flushHeaders) res.flushHeaders();
+    if (res.socket) res.socket.setNoDelay(true);
     res.write('\n');
 
     const cleanup = () => {

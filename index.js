@@ -22,6 +22,33 @@ const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json()); 
 
+app.use((req, res, next) => {
+    res.header("Access-Control-Allow-Origin", "*");
+    res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization");
+    next();
+});
+
+// --- IN-MEMORY LOGGING BUFFER ---
+const MAX_LOGS = 500;
+const logBuffer = [];
+
+const originalLog = console.log;
+const originalError = console.error;
+
+function teeLog(level, originalFn, ...args) {
+    const message = args.map(arg => 
+        typeof arg === 'object' ? JSON.stringify(arg) : String(arg)
+    ).join(' ');
+    
+    logBuffer.push({ timestamp: Date.now(), level, message });
+    if (logBuffer.length > MAX_LOGS) logBuffer.shift();
+    
+    originalFn.apply(console, args);
+}
+
+console.log = (...args) => teeLog('log', originalLog, ...args);
+console.error = (...args) => teeLog('error', originalError, ...args);
+
 // --- FIREBASE SETUP ---
 let serviceAccount;
 try {
@@ -48,7 +75,6 @@ async function useFirestoreAuthState(db, collectionName = 'whatsapp_auth') {
 
     const writeData = async (data, id) => {
         try {
-            // BufferJSON converts buffers & uint8 arrays into storable base64 strings
             const str = JSON.stringify(data, BufferJSON.replacer);
             await collection.doc(id).set({ data: str });
         } catch (err) {
@@ -76,7 +102,6 @@ async function useFirestoreAuthState(db, collectionName = 'whatsapp_auth') {
         }
     };
 
-    // Load credentials from Firestore or generate new ones (for initial QR scan)
     const creds = (await readData('creds')) || initAuthCreds();
 
     return {
@@ -115,7 +140,6 @@ async function useFirestoreAuthState(db, collectionName = 'whatsapp_auth') {
             return writeData(creds, 'creds');
         },
         clearState: async () => {
-            // We only need to delete the primary creds to force a new QR scan
             await removeData('creds');
         }
     };
@@ -129,7 +153,6 @@ let isConnected = false;
 async function startWhatsApp() {
     const logger = pino({ level: 'silent' });
     
-    // Use our custom Firestore Auth adapter instead of useMultiFileAuthState
     const { state, saveCreds, clearState } = await useFirestoreAuthState(db, 'whatsapp_auth');
     const { version } = await fetchLatestBaileysVersion();
 
@@ -166,7 +189,7 @@ async function startWhatsApp() {
                 console.log("System: Device Logged Out. Wiping session from Firestore.");
                 await clearState();
                 qrCodeData = null;
-                startWhatsApp(); // Restart to grab a fresh QR code
+                startWhatsApp(); 
             }
         } else if (connection === 'open') {
             console.log("System: Connection Open and Authenticated. Firebase Auth Sync Active.");
@@ -175,10 +198,8 @@ async function startWhatsApp() {
         }
     });
 
-    // Write updated credentials back to Firestore whenever keys change
     sock.ev.on('creds.update', saveCreds);
 
-    // --- FEATURE: REAL NUMBER SYNC ---
     sock.ev.on('contacts.upsert', async (contacts) => {
         for (const contact of contacts) {
             let updateData = {};
@@ -186,25 +207,20 @@ async function startWhatsApp() {
             
             if (displayName) updateData.displayName = displayName;
 
-            // Extract standard phone number from standard JID
             if (contact.id && contact.id.endsWith('@s.whatsapp.net')) {
                 updateData.phoneNumber = contact.id.split('@')[0];
             }
 
-            // Sync using LID or ID
             const primaryId = contact.lid || contact.id;
 
             if (primaryId && Object.keys(updateData).length > 0) {
                 try {
                     await db.collection('Chats').doc(primaryId).set(updateData, { merge: true });
                     
-                    // Keep the fallback JID document synced as well if we routed via LID
                     if (contact.lid && contact.id !== contact.lid) {
                         await db.collection('Chats').doc(contact.id).set(updateData, { merge: true });
                     }
-                } catch (err) {
-                    // Silent fail to keep logs clean
-                }
+                } catch (err) {}
             }
         }
     });
@@ -235,10 +251,11 @@ async function startWhatsApp() {
                 const isFromMe = msg.key.fromMe || false;
                 const senderName = isFromMe ? "Me" : (msg.pushName || "Unknown");
 
-                // 1. Ensure Chat Document Exists
+                // 1. Ensure Chat Document Exists (Added preview for server-side grouping)
                 await db.collection('Chats').doc(remoteJid).set({
                     lastActive: timestamp,
-                    id: remoteJid
+                    id: remoteJid,
+                    preview: textContent // Makes server-side SSE preview processing extremely lightweight
                 }, { merge: true });
 
                 // 2. Save Message
@@ -255,9 +272,7 @@ async function startWhatsApp() {
                         id: msg.key.id
                     }, { merge: true });
 
-            } catch (err) {
-                // Silent error handling
-            }
+            } catch (err) {}
         }
     });
 }
@@ -277,35 +292,306 @@ function parseCookies(request) {
     return list;
 }
 
+const verifyLogsAccess = (req, res, next) => {
+    let token = req.query.token;
+    if (req.headers.authorization && req.headers.authorization.startsWith('Bearer ')) {
+        token = req.headers.authorization.split(' ')[1];
+    }
+    const cookies = parseCookies(req);
+    
+    if (token === SESSION_SECRET || cookies.auth_session === SESSION_SECRET) {
+        return next();
+    }
+    res.status(401).send('Unauthorized');
+};
+
+// --- SSE CONNECTION MANAGER ---
+const MAX_CONNECTIONS_PER_TOKEN = 15;
+const activeConnections = []; // Tracks all SSE connections for limits/heartbeats
+const clients = {
+    chats: new Set(),
+    messages: new Map() // chatId -> Set of response objects
+};
+
+function enforceConnectionCeiling(req, res, cleanupFunction) {
+    const token = req.query.token || req.headers.authorization?.split(' ')[1];
+    activeConnections.push({ res, token, cleanup: cleanupFunction });
+
+    // Enforce cap per token to prevent free instance exhaustion
+    const userConns = activeConnections.filter(c => c.token === token);
+    if (userConns.length > MAX_CONNECTIONS_PER_TOKEN) {
+        const oldestIdx = activeConnections.findIndex(c => c.token === token);
+        if (oldestIdx > -1) {
+            const oldest = activeConnections[oldestIdx];
+            oldest.cleanup();
+            oldest.res.end();
+            activeConnections.splice(oldestIdx, 1);
+        }
+    }
+
+    res.on('close', () => {
+        const idx = activeConnections.findIndex(c => c.res === res);
+        if (idx > -1) activeConnections.splice(idx, 1);
+        cleanupFunction();
+    });
+}
+
+// Global heartbeat to keep Render connections alive
+setInterval(() => {
+    activeConnections.forEach(({ res }) => {
+        try { res.write(': ping\n\n'); } catch (e) {}
+    });
+}, 25000);
+
+// --- SHARED FIRESTORE LISTENERS ---
+const EXCLUDED_JIDS = new Set(['917278779512@s.whatsapp.net', '201554426618024@lid']);
+
+let chatsUnsubscribe = null;
+const messageListeners = new Map(); // chatId -> unsubscribe function
+
+function startChatsListener() {
+    if (chatsUnsubscribe) return;
+    let isFirstRun = true;
+    chatsUnsubscribe = db.collection('Chats').onSnapshot(snapshot => {
+        if (isFirstRun) {
+            isFirstRun = false; 
+            return; // Clients get initial state from .get(), only push deltas here
+        }
+        const changes = [];
+        snapshot.docChanges().forEach(change => {
+            if (!EXCLUDED_JIDS.has(change.doc.id)) {
+                changes.push({ type: change.type, doc: { id: change.doc.id, ...change.doc.data() } });
+            }
+        });
+        if (changes.length > 0) {
+            const payload = `event: update\ndata: ${JSON.stringify(changes)}\n\n`;
+            clients.chats.forEach(res => { try { res.write(payload); } catch(e){} });
+        }
+    });
+}
+
+function startMessagesListener(chatId) {
+    if (messageListeners.has(chatId)) return;
+    let isFirstRun = true;
+    const unsub = db.collection('Chats').doc(chatId).collection('Messages')
+        .orderBy('timestamp', 'asc')
+        .onSnapshot(snapshot => {
+            if (isFirstRun) {
+                isFirstRun = false;
+                return;
+            }
+            const changes = [];
+            snapshot.docChanges().forEach(change => {
+                changes.push({ type: change.type, doc: { id: change.doc.id, ...change.doc.data() } });
+            });
+            if (changes.length > 0) {
+                const payload = `event: update\ndata: ${JSON.stringify(changes)}\n\n`;
+                const chatClients = clients.messages.get(chatId);
+                if (chatClients) {
+                    chatClients.forEach(res => { try { res.write(payload); } catch(e){} });
+                }
+            }
+        });
+    messageListeners.set(chatId, unsub);
+}
+
 // --- EXPRESS ROUTES ---
 
-// 1. Ping (UptimeRobot)
 app.get('/ping', (req, res) => {
     res.status(200).send('Pong');
 });
 
-// 2. API: Verify Credentials
-app.post('/api/verify', (req, res) => {
-    res.header("Access-Control-Allow-Origin", "*");
-    res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept");
+// Auth Middleware for APIs
+const verifyApiToken = (req, res, next) => {
+    const authHeader = req.headers.authorization;
+    let token = req.query.token;
+    
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+        token = authHeader.split(' ')[1];
+    }
+    
+    if (token === SESSION_SECRET) return next();
+    res.status(401).json({ error: 'Unauthorized' });
+};
 
+app.post('/api/verify', (req, res) => {
     const { username, password } = req.body;
 
     if (username === AUTH_USER && password === AUTH_PASS) {
-        return res.json({ success: true });
+        // Return token directly for the frontend to use in headers/EventSource
+        return res.json({ success: true, token: SESSION_SECRET });
     } else {
         return res.status(401).json({ success: false });
     }
 });
 
-// CORS Pre-flight
 app.options('/api/verify', (req, res) => {
-    res.header("Access-Control-Allow-Origin", "*");
-    res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept");
     res.sendStatus(200);
 });
 
-// 3. Login Page
+// --- API: Server Sent Events ---
+app.get('/api/chats/stream', verifyApiToken, async (req, res) => {
+    res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive'
+    });
+    res.write('\n'); // Flush headers
+
+    const cleanup = () => {
+        clients.chats.delete(res);
+        if (clients.chats.size === 0 && chatsUnsubscribe) {
+            chatsUnsubscribe();
+            chatsUnsubscribe = null;
+        }
+    };
+    
+    enforceConnectionCeiling(req, res, cleanup);
+    clients.chats.add(res);
+
+    // Initial load & Grouping server-side
+    try {
+        const snapshot = await db.collection('Chats').get();
+        const grouped = {};
+        
+        snapshot.docs.forEach(doc => {
+            if (EXCLUDED_JIDS.has(doc.id)) return;
+            
+            const data = { id: doc.id, ...doc.data() };
+            const phone = data.phoneNumber || data.id.split('@')[0];
+            
+            if (!grouped[phone]) {
+                grouped[phone] = { ...data, subIds: [data.id] };
+            } else {
+                grouped[phone].subIds.push(data.id);
+                // Keep the most recent data
+                if ((data.lastActive || 0) > (grouped[phone].lastActive || 0)) {
+                    grouped[phone].lastActive = data.lastActive;
+                    grouped[phone].preview = data.preview || grouped[phone].preview;
+                }
+                if (data.customName) grouped[phone].customName = data.customName;
+            }
+        });
+
+        res.write(`event: initial\ndata: ${JSON.stringify(Object.values(grouped))}\n\n`);
+    } catch (e) {
+        console.error("Error sending initial chats:", e);
+    }
+
+    startChatsListener();
+});
+
+app.get('/api/messages/stream', verifyApiToken, async (req, res) => {
+    const { chatId, since } = req.query;
+    if (!chatId) return res.status(400).send('Missing chatId');
+
+    res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive'
+    });
+    res.write('\n');
+
+    const cleanup = () => {
+        const chatClients = clients.messages.get(chatId);
+        if (chatClients) {
+            chatClients.delete(res);
+            if (chatClients.size === 0 && messageListeners.has(chatId)) {
+                // Garbage collect listener if no one is watching this chat anymore
+                messageListeners.get(chatId)();
+                messageListeners.delete(chatId);
+            }
+        }
+    };
+    
+    enforceConnectionCeiling(req, res, cleanup);
+
+    if (!clients.messages.has(chatId)) {
+        clients.messages.set(chatId, new Set());
+    }
+    clients.messages.get(chatId).add(res);
+
+    try {
+        let query = db.collection('Chats').doc(chatId).collection('Messages').orderBy('timestamp', 'asc');
+        if (since) {
+            query = query.where('timestamp', '>', parseInt(since, 10));
+        }
+        
+        const snapshot = await query.get();
+        const initialMessages = snapshot.docs.map(doc => doc.data());
+        res.write(`event: initial\ndata: ${JSON.stringify(initialMessages)}\n\n`);
+    } catch (e) {
+        console.error("Error sending initial messages:", e);
+    }
+
+    startMessagesListener(chatId);
+});
+
+// --- API: Standard Actions ---
+app.post('/api/rename', verifyApiToken, async (req, res) => {
+    const { id, customName } = req.body;
+    if (!id || !customName) return res.status(400).json({ error: 'Missing parameters' });
+    
+    try {
+        await db.collection('Chats').doc(id).set({ customName }, { merge: true });
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/api/export', verifyApiToken, async (req, res) => {
+    try {
+        const exportData = { chats: {}, messages: {} };
+        const chatsSnap = await db.collection('Chats').get();
+        
+        for (const doc of chatsSnap.docs) {
+            exportData.chats[doc.id] = doc.data();
+            const msgs = await db.collection('Chats').doc(doc.id).collection('Messages').get();
+            exportData.messages[doc.id] = msgs.docs.map(m => m.data());
+        }
+        
+        res.json(exportData);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// --- SYSTEM LOGS ROUTE ---
+app.get('/logs', verifyLogsAccess, (req, res) => {
+    const wantsJson = req.query.format === 'json' || (req.headers.accept && req.headers.accept.includes('application/json'));
+    
+    if (wantsJson) {
+        return res.json(logBuffer);
+    }
+
+    const logLines = logBuffer.map(l => {
+        const time = new Date(l.timestamp).toLocaleTimeString();
+        const color = l.level === 'error' ? '#ff6b6b' : '#a9dc76';
+        return `<div style="color: ${color}">[${time}] [${l.level.toUpperCase()}] ${l.message}</div>`;
+    }).join('');
+
+    res.send(`
+        <html>
+            <head>
+                <meta http-equiv="refresh" content="5">
+                <title>System Logs</title>
+                <style>
+                    body { font-family: monospace; background: #1e1e1e; color: #d4d4d4; padding: 20px; }
+                    .log-container { background: #000; padding: 15px; border-radius: 5px; overflow-x: auto; max-width: 100%; white-space: pre-wrap; font-size: 14px; line-height: 1.5; }
+                </style>
+            </head>
+            <body onload="window.scrollTo(0,document.body.scrollHeight);">
+                <h2 style="color: #fff; margin-top: 0;">System Logs</h2>
+                <div class="log-container">
+                    ${logLines.length > 0 ? logLines : '<div>No logs yet...</div>'}
+                </div>
+            </body>
+        </html>
+    `);
+});
+
+// --- WEB UI ROUTES ---
 app.get('/login', (req, res) => {
     res.send(`
         <html>
@@ -333,7 +619,6 @@ app.get('/login', (req, res) => {
     `);
 });
 
-// 4. Login Action
 app.post('/login', (req, res) => {
     const { username, password, remember } = req.body;
 
@@ -347,13 +632,11 @@ app.post('/login', (req, res) => {
     res.status(401).send('Invalid credentials. <a href="/login">Try again</a>');
 });
 
-// 5. Logout
 app.get('/logout', (req, res) => {
     res.setHeader('Set-Cookie', 'auth_session=; Max-Age=0; Path=/;');
     res.redirect('/login');
 });
 
-// --- MIDDLEWARE ---
 const checkAuth = (req, res, next) => {
     if (!AUTH_USER || !AUTH_PASS) return next();
     const cookies = parseCookies(req);
@@ -365,7 +648,6 @@ const checkAuth = (req, res, next) => {
 
 app.use(checkAuth);
 
-// 6. Main Route
 app.get('/', async (req, res) => {
     const logoutBtn = `<a href="/logout" style="position: absolute; top: 10px; right: 10px; padding: 8px 16px; background: #ff4444; color: white; text-decoration: none; border-radius: 4px; font-size: 14px;">Logout</a>`;
 

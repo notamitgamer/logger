@@ -597,7 +597,7 @@ app.get('/login', (req, res) => {
         <html>
             <body style="font-family: sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; background: #f0f2f5;">
                 <form action="/login" method="POST" style="background: white; padding: 2rem; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); width: 300px;">
-                    <h2 style="margin-top: 0; text-align: center;">WhatsApp Logger</h2>
+                    <h2 style="margin-top: 0; text-align: center;">WhatsApp Logger <span style="font-size: 14px; font-weight: normal; color: #666;">v4.2.1</span></h2>
                     <div style="margin-bottom: 1rem;">
                         <label style="display: block; margin-bottom: 0.5rem;">Username</label>
                         <input type="text" name="username" required style="width: 100%; padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box;">

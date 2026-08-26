@@ -50,16 +50,10 @@ const BASE_STYLES = `
     .brand-mark {
         width: 36px;
         height: 36px;
-        border-radius: 10px;
-        background: var(--accent);
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        color: white;
-        font-weight: 700;
-        font-size: 18px;
         flex-shrink: 0;
+        display: block;
     }
+    .brand-mark img { width: 100%; height: 100%; display: block; }
     .brand-text { text-align: left; }
     .brand-text h1 { font-size: 17px; margin: 0; line-height: 1.2; }
     .brand-text .version { font-size: 12px; color: var(--muted); }
@@ -195,6 +189,7 @@ function layout({ title, refresh, content, wide }) {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+    <link rel="icon" href="/icon.svg" type="image/svg+xml">
     <title>${title}</title>
     ${refresh ? `<meta http-equiv="refresh" content="${refresh}">` : ''}
     <style>${BASE_STYLES}${wide ? ' .page { max-width: 560px; }' : ''}</style>
@@ -207,7 +202,7 @@ function layout({ title, refresh, content, wide }) {
 
 const brand = `
     <div class="brand">
-        <div class="brand-mark">W</div>
+        <div class="brand-mark"><img src="/icon.svg" alt="WhatsApp Logger"></div>
         <div class="brand-text">
             <h1>WhatsApp Logger</h1>
             <div class="version">v${VERSION}</div>
@@ -395,6 +390,7 @@ function logsPage(logBuffer) {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+    <link rel="icon" href="/icon.svg" type="image/svg+xml">
     <meta http-equiv="refresh" content="5">
     <title>System Logs</title>
     <style>

@@ -15,6 +15,8 @@ const statusRoutes = require('./src/routes/status');
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
+// Static assets (favicon/logo) — served unauthenticated, before any login check
+app.use(express.static('public'));
 
 app.use((req, res, next) => {
     res.header("Access-Control-Allow-Origin", "*");

@@ -106,6 +106,50 @@ router.get('/api/messages/stream', verifyApiToken, async (req, res) => {
     }
 });
 
+// Global sync stream: one connection covers messages for ALL chats, so the
+// client doesn't need to open a new SSE connection per chat it opens.
+router.get('/api/sync/stream', verifyApiToken, async (req, res) => {
+    if (!isCacheReady()) return res.status(503).json({ error: 'Cache still warming, retry shortly' });
+
+    const { since } = req.query;
+
+    res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no'
+    });
+    if (res.flushHeaders) res.flushHeaders();
+    if (res.socket) res.socket.setNoDelay(true);
+    res.write('\n');
+
+    const cleanup = () => {
+        clients.sync.delete(res);
+    };
+
+    enforceConnectionCeiling(req, res, cleanup);
+    clients.sync.add(res);
+
+    try {
+        const sinceTs = since ? parseInt(since, 10) : 0;
+        const initialMessages = [];
+
+        messagesCache.forEach((msgMap, chatId) => {
+            for (const msg of msgMap.values()) {
+                if (msg.timestamp > sinceTs) {
+                    initialMessages.push({ ...msg, chatId });
+                }
+            }
+        });
+
+        initialMessages.sort((a, b) => a.timestamp - b.timestamp);
+
+        res.write(`event: initial\ndata: ${JSON.stringify(initialMessages)}\n\n`);
+    } catch (e) {
+        console.error("Error sending initial sync payload:", e);
+    }
+});
+
 // --- API: Standard Actions ---
 router.post('/api/rename', verifyApiToken, async (req, res) => {
     if (!isCacheReady()) return res.status(503).json({ error: 'Cache still warming, retry shortly' });

@@ -150,6 +150,47 @@ router.get('/api/sync/stream', verifyApiToken, async (req, res) => {
     }
 });
 
+// --- API: Full Resync (used by the client's "Reset" flow) ---
+// Lightweight manifest: chat metadata + per-chat message counts, no message
+// bodies. Lets the client know the true total up front so it can show real
+// download progress instead of a fake/local-only percentage.
+router.get('/api/export/chats', verifyApiToken, async (req, res) => {
+    if (!isCacheReady()) return res.status(503).json({ error: 'Cache still warming, retry shortly' });
+
+    try {
+        const chats = [];
+        let totalMessages = 0;
+
+        chatsCache.forEach((data, id) => {
+            const count = messagesCache.has(id) ? messagesCache.get(id).size : 0;
+            totalMessages += count;
+            chats.push({ ...data, messageCount: count });
+        });
+
+        res.json({ chats, totalMessages });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Plain JSON (not SSE) — all messages for a single chat. Called once per
+// chat by the client's resync loop so progress can be updated after each
+// chat finishes, instead of waiting on one all-chats blob.
+router.get('/api/export/messages', verifyApiToken, async (req, res) => {
+    if (!isCacheReady()) return res.status(503).json({ error: 'Cache still warming, retry shortly' });
+
+    const { chatId } = req.query;
+    if (!chatId) return res.status(400).json({ error: 'Missing chatId' });
+
+    try {
+        const msgMap = messagesCache.get(chatId);
+        const messages = msgMap ? Array.from(msgMap.values()) : [];
+        res.json({ chatId, messages });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // --- API: Standard Actions ---
 router.post('/api/rename', verifyApiToken, async (req, res) => {
     if (!isCacheReady()) return res.status(503).json({ error: 'Cache still warming, retry shortly' });

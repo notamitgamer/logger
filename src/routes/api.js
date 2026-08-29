@@ -150,6 +150,29 @@ router.get('/api/sync/stream', verifyApiToken, async (req, res) => {
     }
 });
 
+// --- API: Full Resync (used by the client's "Reset" flow) ---
+// Lightweight manifest: chat metadata + per-chat message counts, no message
+// bodies. Lets the client know the true total up front so it can show real
+// download progress instead of a fake/local-only percentage.
+router.get('/api/export/chats', verifyApiToken, async (req, res) => {
+    if (!isCacheReady()) return res.status(503).json({ error: 'Cache still warming, retry shortly' });
+
+    try {
+        const chats = [];
+        let totalMessages = 0;
+
+        chatsCache.forEach((data, id) => {
+            const count = messagesCache.has(id) ? messagesCache.get(id).size : 0;
+            totalMessages += count;
+            chats.push({ ...data, messageCount: count });
+        });
+
+        res.json({ chats, totalMessages });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // --- API: Standard Actions ---
 router.post('/api/rename', verifyApiToken, async (req, res) => {
     if (!isCacheReady()) return res.status(503).json({ error: 'Cache still warming, retry shortly' });

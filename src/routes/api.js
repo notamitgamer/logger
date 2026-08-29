@@ -173,6 +173,24 @@ router.get('/api/export/chats', verifyApiToken, async (req, res) => {
     }
 });
 
+// Plain JSON (not SSE) — all messages for a single chat. Called once per
+// chat by the client's resync loop so progress can be updated after each
+// chat finishes, instead of waiting on one all-chats blob.
+router.get('/api/export/messages', verifyApiToken, async (req, res) => {
+    if (!isCacheReady()) return res.status(503).json({ error: 'Cache still warming, retry shortly' });
+
+    const { chatId } = req.query;
+    if (!chatId) return res.status(400).json({ error: 'Missing chatId' });
+
+    try {
+        const msgMap = messagesCache.get(chatId);
+        const messages = msgMap ? Array.from(msgMap.values()) : [];
+        res.json({ chatId, messages });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // --- API: Standard Actions ---
 router.post('/api/rename', verifyApiToken, async (req, res) => {
     if (!isCacheReady()) return res.status(503).json({ error: 'Cache still warming, retry shortly' });

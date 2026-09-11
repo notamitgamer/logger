@@ -124,7 +124,10 @@ async function startWhatsApp() {
                 const protocolMsg = msg.message.protocolMessage;
                 if (protocolMsg && protocolMsg.type === proto.Message.ProtocolMessage.Type.MESSAGE_EDIT) {
                     const targetId = protocolMsg.key?.id;
-                    if (!targetId) continue;
+                    if (!targetId) {
+                        console.error('System: Received MESSAGE_EDIT protocol message with no target key — ignoring.');
+                        continue;
+                    }
 
                     const editedText =
                         protocolMsg.editedMessage?.conversation ||
@@ -133,7 +136,10 @@ async function startWhatsApp() {
                         protocolMsg.editedMessage?.videoMessage?.caption ||
                         "";
 
-                    if (!editedText) continue;
+                    if (!editedText) {
+                        console.error(`System: Received edit for ${targetId} with no extractable text — ignoring.`);
+                        continue;
+                    }
 
                     const editTimestamp = msg.messageTimestamp
                         ? (typeof msg.messageTimestamp === 'number' ? msg.messageTimestamp : msg.messageTimestamp.low)
@@ -141,31 +147,50 @@ async function startWhatsApp() {
 
                     const msgRef = db.collection('Chats').doc(remoteJid).collection('Messages').doc(targetId);
 
-                    try {
-                        await db.runTransaction(async (tx) => {
-                            const snap = await tx.get(msgRef);
-                            if (!snap.exists) return; // original was never logged; nothing to attach history to
+                    // Guard against a race: if this edit arrives before the original
+                    // message's own write has committed (e.g. someone edits within
+                    // ~1s of sending), the doc won't exist yet. Retry briefly instead
+                    // of silently dropping the edit.
+                    let applied = false;
+                    for (let attempt = 0; attempt < 3 && !applied; attempt++) {
+                        if (attempt > 0) await new Promise(r => setTimeout(r, 500 * attempt));
 
-                            const data = snap.data();
-                            const priorEdits = Array.isArray(data.edits) ? data.edits : [];
+                        try {
+                            applied = await db.runTransaction(async (tx) => {
+                                const snap = await tx.get(msgRef);
+                                if (!snap.exists) return false;
 
-                            // On the first edit, seed history with the pre-edit text so
-                            // the original is preserved alongside every later revision.
-                            const history = priorEdits.length > 0
-                                ? priorEdits
-                                : [{ text: data.text, timestamp: data.timestamp }];
+                                const data = snap.data();
+                                const priorEdits = Array.isArray(data.edits) ? data.edits : [];
 
-                            history.push({ text: editedText, timestamp: editTimestamp });
+                                // On the first edit, seed history with the pre-edit text so
+                                // the original is preserved alongside every later revision.
+                                const history = priorEdits.length > 0
+                                    ? priorEdits
+                                    : [{ text: data.text, timestamp: data.timestamp }];
 
-                            tx.set(msgRef, {
-                                text: editedText,       // latest text — existing UI keeps working unchanged
-                                edited: true,
-                                editCount: history.length - 1,
-                                lastEditedAt: editTimestamp,
-                                edits: history           // full chronological history, oldest (original) first
-                            }, { merge: true });
-                        });
-                    } catch (err) {}
+                                history.push({ text: editedText, timestamp: editTimestamp });
+
+                                tx.set(msgRef, {
+                                    text: editedText,       // latest text — existing UI keeps working unchanged
+                                    edited: true,
+                                    editCount: history.length - 1,
+                                    lastEditedAt: editTimestamp,
+                                    edits: history           // full chronological history, oldest (original) first
+                                }, { merge: true });
+
+                                return true;
+                            });
+                        } catch (err) {
+                            console.error(`System: Edit-history transaction failed for ${targetId} (attempt ${attempt + 1}):`, err.message);
+                        }
+                    }
+
+                    if (applied) {
+                        console.log(`System: Recorded edit for message ${targetId} in ${remoteJid}.`);
+                    } else {
+                        console.error(`System: Could not attach edit for message ${targetId} in ${remoteJid} — original was never found (gave up after retries).`);
+                    }
 
                     continue;
                 }

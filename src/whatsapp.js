@@ -1,7 +1,8 @@
 const {
     default: makeWASocket,
     DisconnectReason,
-    fetchLatestBaileysVersion
+    fetchLatestBaileysVersion,
+    proto
 } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const { db } = require('./firebase');
@@ -113,6 +114,61 @@ async function startWhatsApp() {
 
                 const remoteJid = msg.key.remoteJid;
                 if (remoteJid === 'status@broadcast') continue;
+
+                // --- Edited message handling ---
+                // WhatsApp sends an edit as a protocolMessage referencing the
+                // original message's key, carrying the new content. We keep
+                // the original text plus every subsequent edit in `edits`
+                // (oldest first) so the UI can show "original -> edit 1 -> edit 2..."
+                // instead of overwriting history.
+                const protocolMsg = msg.message.protocolMessage;
+                if (protocolMsg && protocolMsg.type === proto.Message.ProtocolMessage.Type.MESSAGE_EDIT) {
+                    const targetId = protocolMsg.key?.id;
+                    if (!targetId) continue;
+
+                    const editedText =
+                        protocolMsg.editedMessage?.conversation ||
+                        protocolMsg.editedMessage?.extendedTextMessage?.text ||
+                        protocolMsg.editedMessage?.imageMessage?.caption ||
+                        protocolMsg.editedMessage?.videoMessage?.caption ||
+                        "";
+
+                    if (!editedText) continue;
+
+                    const editTimestamp = msg.messageTimestamp
+                        ? (typeof msg.messageTimestamp === 'number' ? msg.messageTimestamp : msg.messageTimestamp.low)
+                        : Math.floor(Date.now() / 1000);
+
+                    const msgRef = db.collection('Chats').doc(remoteJid).collection('Messages').doc(targetId);
+
+                    try {
+                        await db.runTransaction(async (tx) => {
+                            const snap = await tx.get(msgRef);
+                            if (!snap.exists) return; // original was never logged; nothing to attach history to
+
+                            const data = snap.data();
+                            const priorEdits = Array.isArray(data.edits) ? data.edits : [];
+
+                            // On the first edit, seed history with the pre-edit text so
+                            // the original is preserved alongside every later revision.
+                            const history = priorEdits.length > 0
+                                ? priorEdits
+                                : [{ text: data.text, timestamp: data.timestamp }];
+
+                            history.push({ text: editedText, timestamp: editTimestamp });
+
+                            tx.set(msgRef, {
+                                text: editedText,       // latest text — existing UI keeps working unchanged
+                                edited: true,
+                                editCount: history.length - 1,
+                                lastEditedAt: editTimestamp,
+                                edits: history           // full chronological history, oldest (original) first
+                            }, { merge: true });
+                        });
+                    } catch (err) {}
+
+                    continue;
+                }
 
                 const textContent =
                     msg.message.conversation ||

@@ -17,6 +17,12 @@ let consecutiveAuthFailures = 0;
 let consecutiveConnectFailures = 0;
 
 async function startWhatsApp() {
+    // Temporary build marker for diagnosing the edit-history rollout —
+    // if this line isn't in the logs after a restart, Render is still
+    // serving an older image and none of the edit-tracking code below
+    // is actually running yet.
+    console.log("System: Build tag = edit-history-diagnostics-v1");
+
     const logger = pino({ level: 'silent' });
 
     let authResult;
@@ -122,7 +128,19 @@ async function startWhatsApp() {
                 // (oldest first) so the UI can show "original -> edit 1 -> edit 2..."
                 // instead of overwriting history.
                 const protocolMsg = msg.message.protocolMessage;
-                if (protocolMsg && protocolMsg.type === proto.Message.ProtocolMessage.Type.MESSAGE_EDIT) {
+
+                // Diagnostic: log the raw shape of ANY protocol message (edits,
+                // deletes, app-state syncs, etc.) so we can see exactly what
+                // WhatsApp is actually sending instead of assuming. protocolMessages
+                // are rare in normal traffic, so this won't be noisy.
+                if (protocolMsg) {
+                    console.log(`System: protocolMessage seen in ${remoteJid} — type=${protocolMsg.type}, keys=[${Object.keys(protocolMsg).join(',')}]`);
+                }
+
+                // Treat it as an edit if either the type enum matches MESSAGE_EDIT,
+                // OR (as a fallback, in case this Baileys/WA version reports a
+                // different type value) it simply carries an editedMessage payload.
+                if (protocolMsg && (protocolMsg.type === proto.Message.ProtocolMessage.Type.MESSAGE_EDIT || protocolMsg.editedMessage)) {
                     const targetId = protocolMsg.key?.id;
                     if (!targetId) {
                         console.error('System: Received MESSAGE_EDIT protocol message with no target key — ignoring.');

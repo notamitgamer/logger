@@ -1,8 +1,7 @@
 const {
     default: makeWASocket,
     DisconnectReason,
-    fetchLatestBaileysVersion,
-    proto
+    fetchLatestBaileysVersion
 } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const { db } = require('./firebase');
@@ -17,12 +16,6 @@ let consecutiveAuthFailures = 0;
 let consecutiveConnectFailures = 0;
 
 async function startWhatsApp() {
-    // Temporary build marker for diagnosing the edit-history rollout —
-    // if this line isn't in the logs after a restart, Render is still
-    // serving an older image and none of the edit-tracking code below
-    // is actually running yet.
-    console.log("System: Build tag = edit-history-diagnostics-v1");
-
     const logger = pino({ level: 'silent' });
 
     let authResult;
@@ -121,98 +114,6 @@ async function startWhatsApp() {
                 const remoteJid = msg.key.remoteJid;
                 if (remoteJid === 'status@broadcast') continue;
 
-                // --- Edited message handling ---
-                // WhatsApp sends an edit as a protocolMessage referencing the
-                // original message's key, carrying the new content. We keep
-                // the original text plus every subsequent edit in `edits`
-                // (oldest first) so the UI can show "original -> edit 1 -> edit 2..."
-                // instead of overwriting history.
-                const protocolMsg = msg.message.protocolMessage;
-
-                // Diagnostic: log the raw shape of ANY protocol message (edits,
-                // deletes, app-state syncs, etc.) so we can see exactly what
-                // WhatsApp is actually sending instead of assuming. protocolMessages
-                // are rare in normal traffic, so this won't be noisy.
-                if (protocolMsg) {
-                    console.log(`System: protocolMessage seen in ${remoteJid} — type=${protocolMsg.type}, keys=[${Object.keys(protocolMsg).join(',')}]`);
-                }
-
-                // Treat it as an edit if either the type enum matches MESSAGE_EDIT,
-                // OR (as a fallback, in case this Baileys/WA version reports a
-                // different type value) it simply carries an editedMessage payload.
-                if (protocolMsg && (protocolMsg.type === proto.Message.ProtocolMessage.Type.MESSAGE_EDIT || protocolMsg.editedMessage)) {
-                    const targetId = protocolMsg.key?.id;
-                    if (!targetId) {
-                        console.error('System: Received MESSAGE_EDIT protocol message with no target key — ignoring.');
-                        continue;
-                    }
-
-                    const editedText =
-                        protocolMsg.editedMessage?.conversation ||
-                        protocolMsg.editedMessage?.extendedTextMessage?.text ||
-                        protocolMsg.editedMessage?.imageMessage?.caption ||
-                        protocolMsg.editedMessage?.videoMessage?.caption ||
-                        "";
-
-                    if (!editedText) {
-                        console.error(`System: Received edit for ${targetId} with no extractable text — ignoring.`);
-                        continue;
-                    }
-
-                    const editTimestamp = msg.messageTimestamp
-                        ? (typeof msg.messageTimestamp === 'number' ? msg.messageTimestamp : msg.messageTimestamp.low)
-                        : Math.floor(Date.now() / 1000);
-
-                    const msgRef = db.collection('Chats').doc(remoteJid).collection('Messages').doc(targetId);
-
-                    // Guard against a race: if this edit arrives before the original
-                    // message's own write has committed (e.g. someone edits within
-                    // ~1s of sending), the doc won't exist yet. Retry briefly instead
-                    // of silently dropping the edit.
-                    let applied = false;
-                    for (let attempt = 0; attempt < 3 && !applied; attempt++) {
-                        if (attempt > 0) await new Promise(r => setTimeout(r, 500 * attempt));
-
-                        try {
-                            applied = await db.runTransaction(async (tx) => {
-                                const snap = await tx.get(msgRef);
-                                if (!snap.exists) return false;
-
-                                const data = snap.data();
-                                const priorEdits = Array.isArray(data.edits) ? data.edits : [];
-
-                                // On the first edit, seed history with the pre-edit text so
-                                // the original is preserved alongside every later revision.
-                                const history = priorEdits.length > 0
-                                    ? priorEdits
-                                    : [{ text: data.text, timestamp: data.timestamp }];
-
-                                history.push({ text: editedText, timestamp: editTimestamp });
-
-                                tx.set(msgRef, {
-                                    text: editedText,       // latest text — existing UI keeps working unchanged
-                                    edited: true,
-                                    editCount: history.length - 1,
-                                    lastEditedAt: editTimestamp,
-                                    edits: history           // full chronological history, oldest (original) first
-                                }, { merge: true });
-
-                                return true;
-                            });
-                        } catch (err) {
-                            console.error(`System: Edit-history transaction failed for ${targetId} (attempt ${attempt + 1}):`, err.message);
-                        }
-                    }
-
-                    if (applied) {
-                        console.log(`System: Recorded edit for message ${targetId} in ${remoteJid}.`);
-                    } else {
-                        console.error(`System: Could not attach edit for message ${targetId} in ${remoteJid} — original was never found (gave up after retries).`);
-                    }
-
-                    continue;
-                }
-
                 const textContent =
                     msg.message.conversation ||
                     msg.message.extendedTextMessage?.text ||
@@ -250,6 +151,89 @@ async function startWhatsApp() {
                         id: msg.key.id
                     }, { merge: true });
 
+            } catch (err) {}
+        }
+    });
+
+    // --- Edited message handling ---
+    // Unlike a regular new message, an edit to an existing message arrives
+    // via messages.update (not messages.upsert). Baileys already unwraps it:
+    // `key` is the ORIGINAL message's key, and `update.message` is the new
+    // content directly — there's no protocolMessage/editedMessage nesting on
+    // the receiving side (that shape is only for constructing an outgoing
+    // edit yourself via sock.sendMessage(..., { edit: key })).
+    //
+    // We keep the original text plus every subsequent edit in `edits`
+    // (oldest first) so the UI can show original -> edit 1 -> edit 2 ...
+    // instead of overwriting history.
+    sock.ev.on('messages.update', async (updates) => {
+        for (const { key, update } of updates) {
+            try {
+                if (!update.message) continue; // not an edit (e.g. a status/ack update)
+
+                const remoteJid = key.remoteJid;
+                const targetId = key.id;
+                if (!remoteJid || !targetId || remoteJid === 'status@broadcast') continue;
+
+                const editedText =
+                    update.message.conversation ||
+                    update.message.extendedTextMessage?.text ||
+                    update.message.imageMessage?.caption ||
+                    update.message.videoMessage?.caption ||
+                    "";
+
+                if (!editedText) {
+                    console.error(`System: Received edit for ${targetId} with no extractable text — ignoring.`);
+                    continue;
+                }
+
+                const editTimestamp = Math.floor(Date.now() / 1000);
+                const msgRef = db.collection('Chats').doc(remoteJid).collection('Messages').doc(targetId);
+
+                // Guard against a race: if this edit arrives before the original
+                // message's own write has committed (e.g. someone edits within
+                // ~1s of sending), the doc won't exist yet. Retry briefly instead
+                // of silently dropping the edit.
+                let applied = false;
+                for (let attempt = 0; attempt < 3 && !applied; attempt++) {
+                    if (attempt > 0) await new Promise(r => setTimeout(r, 500 * attempt));
+
+                    try {
+                        applied = await db.runTransaction(async (tx) => {
+                            const snap = await tx.get(msgRef);
+                            if (!snap.exists) return false;
+
+                            const data = snap.data();
+                            const priorEdits = Array.isArray(data.edits) ? data.edits : [];
+
+                            // On the first edit, seed history with the pre-edit text so
+                            // the original is preserved alongside every later revision.
+                            const history = priorEdits.length > 0
+                                ? priorEdits
+                                : [{ text: data.text, timestamp: data.timestamp }];
+
+                            history.push({ text: editedText, timestamp: editTimestamp });
+
+                            tx.set(msgRef, {
+                                text: editedText,       // latest text — existing UI keeps working unchanged
+                                edited: true,
+                                editCount: history.length - 1,
+                                lastEditedAt: editTimestamp,
+                                edits: history           // full chronological history, oldest (original) first
+                            }, { merge: true });
+
+                            return true;
+                        });
+                    } catch (err) {
+                        console.error(`System: Edit-history transaction failed for ${targetId} (attempt ${attempt + 1}):`, err.message);
+                    }
+                }
+
+                if (applied) {
+                    console.log(`System: Recorded edit for message ${targetId} in ${remoteJid}.`);
+                } else {
+                    console.error(`System: Could not attach edit for message ${targetId} in ${remoteJid} — original was never found (gave up after retries).`);
+                }
             } catch (err) {}
         }
     });
